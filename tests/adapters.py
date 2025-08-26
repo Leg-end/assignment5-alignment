@@ -14,7 +14,7 @@ def run_tokenize_prompt_and_output(
     output_strs: list[str],
     tokenizer: PreTrainedTokenizerBase,
 ) -> dict[str, Tensor]:
-    """Tokenize the prompt and output strings, and construct a mask that is 1
+    """Tokenize the prompt and output strings separately, and construct a mask that is 1
     for the response tokens and 0 for other tokens (prompt or padding).
 
     Args:
@@ -31,7 +31,30 @@ def run_tokenize_prompt_and_output(
             "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
                 a mask on the response tokens in `labels`.
     """
-    raise NotImplementedError
+    input_ids_list = []
+    response_mask_list = []
+    for prompt_str, output_str in zip(prompt_strs, output_strs):
+        prompt_ids = tokenizer(prompt_str, add_special_tokens=False)['input_ids']
+        output_ids = tokenizer(output_str, add_special_tokens=False)['input_ids']
+        input_ids = prompt_ids + output_ids
+        response_mask = [0] * len(prompt_ids) + [1] * len(output_ids)
+        input_ids_list.append(torch.tensor(input_ids, dtype=torch.long))
+        response_mask_list.append(torch.tensor(response_mask, dtype=torch.long))
+    
+    max_len = max(len(ids) for ids in input_ids_list)
+    batch_input_ids = torch.full((len(input_ids_list), max_len), tokenizer.pad_token_id, dtype=torch.long)
+    batch_reponse_masks = torch.zeros((len(input_ids_list), max_len), dtype=torch.long)
+    
+    for i, (input_ids, response_mask) in enumerate(zip(input_ids_list, response_mask_list)):
+        seq_len = len(input_ids)
+        batch_input_ids[i, :seq_len] = input_ids
+        batch_reponse_masks[i, :seq_len] = response_mask
+    
+    return {
+        "input_ids": batch_input_ids[:, :-1],
+        "labels": batch_input_ids[:, 1:],
+        "response_mask": batch_reponse_masks[:, 1:],
+    }   
 
 
 def run_compute_group_normalized_rewards(
@@ -77,12 +100,49 @@ def run_compute_group_normalized_rewards(
                 You may choose what you wish to log here
                 (some statistics of the rewards, etc.).
     """
-    raise NotImplementedError
+    rewards = []
+    format_rewards = []
+    answer_rewards = []
+    # for a batch of questions, each question will samples group_size response
+    # that makes total batch_size x group_size responses
+    for response, ground_truth in zip(rollout_responses, repeated_ground_truths):
+        reward_dict = reward_fn(response, ground_truth)
+        rewards.append(reward_dict["reward"])
+        format_rewards.append(reward_dict["format_reward"])
+        answer_rewards.append(reward_dict["answer_reward"])
+    rewards = torch.tensor(rewards, dtype=torch.float32)
+    
+    N = len(rewards)
+    assert N % group_size == 0, "Rollout batch size must be divisible by group_size"
+    n_groups = N // group_size
+    
+    group_rewards = rewards.view(n_groups, group_size)
+    group_means = group_rewards.mean(dim=-1, keepdim=True)
+    normalized_rewards = group_rewards - group_means
+    if normalize_by_std:
+        group_stds = group_rewards.std(dim=-1, keepdim=True)
+        normalized_rewards = normalized_rewards / (group_stds + advantage_eps)
+    normalized_rewards = normalized_rewards.view(-1)
+    
+    metadata = {
+        "reward/mean": rewards.mean().item(),
+        "reward/std": rewards.std().item(),
+        "reward/max": rewards.max().item(),
+        "reward/min": rewards.min().item(),
+        "format_reward/mean": sum(format_rewards) / N,
+        "answer_reward/mean": sum(answer_rewards) / N
+    }
+    return normalized_rewards, rewards, metadata
 
 
 def run_compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     """Get the entropy of the logits (i.e., entropy of the final dimension)."""
-    raise NotImplementedError
+    # - sum(p(x) * log(p(x))) = sum(p(x) * logsumexp(l(x))) - sum(p(x) * l(x)) = logsumexp(l(x)) - sum(p(x) * l(x))
+    lse = torch.logsumexp(logits, dim=-1)
+    probs = torch.softmax(logits, dim=-1)
+    expected_logits = torch.sum(probs * logits, dim=-1)
+    entropy = lse - expected_logits
+    return entropy
 
 
 def run_get_response_log_probs(
@@ -90,6 +150,7 @@ def run_get_response_log_probs(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     return_token_entropy: bool,
+    return_token_id: bool = False
 ) -> torch.Tensor:
     """Get the conditional log-probs of the response given the prompt,
         and optionally the entropy of the next token predictions.
@@ -114,7 +175,16 @@ def run_get_response_log_probs(
                 we have not masked out the token indices corresponding to the prompt
                 or padding; that is done in the train loop.
     """
-    raise NotImplementedError
+    logits = model(input_ids).logits  # batch, seq_len, vocab_size
+    log_probs = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(logits, dim=-1)
+    return_dict = {"log_probs": log_probs}
+    if return_token_entropy:
+        token_entropy = run_compute_entropy(logits)
+        return_dict["token_entropy"] = token_entropy
+    if return_token_id:
+        token_ids = torch.argmax(logits, dim=-1)
+        return_dict["token_ids"] = token_ids
+    return return_dict
 
 
 def run_compute_naive_policy_gradient_loss(
@@ -133,7 +203,7 @@ def run_compute_naive_policy_gradient_loss(
         torch.Tensor of shape (batch_size, sequence_length): 
             the policy gradient per-token loss.
     """
-    raise NotImplementedError
+    return -raw_rewards_or_advantages * policy_log_probs
 
 
 def run_compute_grpo_clip_loss(
@@ -160,7 +230,15 @@ def run_compute_grpo_clip_loss(
             dict[str, torch.Tensor]: metadata for the GRPO-Clip loss 
                 (used to compute clip fraction).
     """
-    raise NotImplementedError
+    ratio = torch.exp(policy_log_probs - old_log_probs)  # importance sampling ratio
+    clipped_ratio = torch.clamp(ratio, 1 - cliprange, 1 + cliprange)
+    lhs, rhs = ratio * advantages, clipped_ratio * advantages
+    loss = -torch.min(lhs, rhs)
+    
+    metadata = {
+        "clipped": (rhs < lhs).float()
+    }
+    return loss, metadata
 
 
 def run_compute_policy_gradient_loss(
@@ -174,7 +252,27 @@ def run_compute_policy_gradient_loss(
     """
     Wrapper that delegates to the appropriate policy gradient loss function above.
     """
-    raise NotImplementedError
+    batch_size, seq_len = policy_log_probs.shape
+    if loss_type == "no_baseline":
+        assert raw_rewards is not None, "raw_rewards must be provided for loss_type=no_baseline"
+        assert raw_rewards.shape == (batch_size, 1), "raw_rewards must have shape (batch_size, 1)"
+        loss = run_compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs)
+        metadata = {}
+    elif loss_type == "reinforce_with_baseline":
+        assert advantages is not None, "advantages must be provided for loss_type=reinforce_with_baseline"
+        assert advantages.shape == (batch_size, 1), "advantages must have shape (batch_size, 1)"
+        loss = run_compute_naive_policy_gradient_loss(advantages, policy_log_probs)
+        metadata = {}
+    elif loss_type == "grpo_clip":
+        assert advantages is not None, "advantages must be provided for loss_type=grpo_clip"
+        assert advantages.shape == (batch_size, 1), "advantages must have shape (batch_size, 1)"
+        assert cliprange is not None, "cliprange must be provided for loss_type=grpo_clip"
+        assert old_log_probs is not None, "old_log_probs must be provided for loss_type=grpo_clip"
+        assert old_log_probs.shape == (batch_size, seq_len), "old_log_probs must have shape (batch_size, sequence_length)"
+        loss, metadata = run_compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+    else:
+        raise ValueError(f"Invalid loss type: {loss_type}")
+    return loss, metadata
 
 
 def run_masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = None) -> torch.Tensor:
@@ -200,10 +298,24 @@ def run_sft_microbatch_train_step(
     response_mask: torch.Tensor,
     gradient_accumulation_steps: int,
     normalize_constant: int | None = 1.0,
+    return_metadata: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch.
     """
-    raise NotImplementedError
+    batch_size, seq_len = policy_log_probs.shape
+    total_loss = run_masked_normalize(-policy_log_probs, response_mask, normalize_constant=normalize_constant)
+    loss = total_loss / batch_size / gradient_accumulation_steps
+    loss.backward()
+    
+    if return_metadata:
+        n_tokens = response_mask.sum().item()
+        avg_token_ce = total_loss.item() / (n_tokens + 1e-8)
+        metadata = {"train/avg_token_ce": avg_token_ce,
+                    "train/total_loss": total_loss.item(),
+                    "train/n_tokens": n_tokens}
+    else:
+        metadata = {}
+    return loss.detach(), metadata
 
     
 def run_grpo_microbatch_train_step(
@@ -267,7 +379,9 @@ def run_masked_normalize(
         torch.Tensor, the normalized sum, where masked elements
             (mask=0) don't contribute to the sum.
     """
-    raise NotImplementedError
+    masked_tensor = tensor * mask
+    sum_val = masked_tensor.sum(dim=dim)
+    return sum_val / normalize_constant
 
 
 """

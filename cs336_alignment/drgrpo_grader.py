@@ -1019,6 +1019,10 @@ def r1_zero_reward_fn(response, ground_truth, fast=True):
                 }
         if isinstance(ground_truth, float) or isinstance(ground_truth, int):
             ground_truth = str(ground_truth)
+        # print("model_answer: \n\t")
+        # print(model_answer, '\n')
+        # print("ground_truth: \n\t")
+        # print(ground_truth)
         if isinstance(ground_truth, str):
             is_correct = grade(model_answer, ground_truth, fast)
         elif isinstance(ground_truth, list):
