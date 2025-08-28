@@ -4,8 +4,9 @@ os.environ["HF_HOME"] = "/data/lanyun/worksapce/assignment5-alignment/models"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import comet_ml as comet
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
-from vllm import LLM, SamplingParams, RequestOutput
+from vllm import LLM, SamplingParams
 from unittest.mock import patch
 from transformers import PreTrainedModel
 from torch.utils.data import DataLoader
@@ -14,12 +15,9 @@ from cs336_alignment.data_utils import get_data_loader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase, AutoModelForCausalLM
 from cs336_alignment.utils import set_logger
 from cs336_alignment.evaluate import evaluate_vllm
-from typing import Callable
-from collections import defaultdict
 import logging
 
 import torch
-import wandb
 
 
 def init_vllm(model_id: str,
@@ -77,7 +75,7 @@ def evaluate(eval_loader: DataLoader,
     return eval_loss, eval_results
     
 
-def train(run,
+def train(experiment,
           train_loader: DataLoader,
           eval_loader: DataLoader,
           tokenizer: PreTrainedTokenizerBase,
@@ -108,7 +106,6 @@ def train(run,
     best_eval_loss = float('inf')
     sampling_params = SamplingParams(temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"],
                                      include_stop_str_in_output=True, logprobs=1)
-    tokenizer = None
     while step < total_steps:
         for idx, batch in enumerate(train_loader):
             prompt_strs, response_strs = batch
@@ -116,6 +113,7 @@ def train(run,
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             response_mask = batch["response_mask"].to(device)
+            # TODO filter out wrong outputs with low rewards
             do_backward = (idx + 1) % gradient_accumulation_steps == 0
             output = run_get_response_log_probs(model=model,
                                                 input_ids=input_ids,
@@ -129,9 +127,9 @@ def train(run,
                 normalize_constant=1.0,
                 return_metadata=do_backward
             )
-            #  use gradient clipping with clip value 1.0
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             if do_backward:
+                #  use gradient clipping with clip value 1.0, must do before optimizer.step()
+                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 
@@ -143,9 +141,10 @@ def train(run,
                 
                 if step % log_interval == 0:
                     logging.info(f"Step [{step}/{total_steps}], Loss: {loss.item():.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
-                    run.log({'train/loss': loss.item(),
+                    experiment.log_metrics({'train/loss': loss.item(),
                              'train/lr': optimizer.param_groups[0]['lr'],
                              'train/avg_next_token_ce': output['token_entropy'].mean().item(),
+                             'train/gradient_norm': gnorm.item(),
                              **metadata}, step=step)
                     
                 if step % eval_interval == 0:
@@ -153,7 +152,7 @@ def train(run,
                     load_policy_into_vllm_instance(model, eval_model)
                     eval_loss, eval_metadata = evaluate(eval_loader, eval_model, sampling_params)
                     logging.info(f"Step [{step}/{total_steps}], Eval Loss: {eval_loss:.4f}")
-                    run.log({'eval/loss': eval_loss,
+                    experiment.log_metrics({'eval/loss': eval_loss,
                              **eval_metadata}, step=step)
                     if eval_loss < best_eval_loss:
                         best_eval_loss = eval_loss
@@ -186,16 +185,16 @@ def main(model_name_or_path: str,
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     train_loader, eval_loader = get_data_loader(data_path=data_path,
                                                 eval_data_path=eval_data_path,
-                                                 instruction=instruction,
-                                                 num_examples=num_examples,
-                                                 batch_size=8,
-                                                 num_workers=4,
-                                                 eval_ratio=0.1,
-                                                 eval_batch_size=2)
+                                                instruction=instruction,
+                                                num_examples=num_examples,
+                                                batch_size=8,
+                                                num_workers=4,
+                                                eval_ratio=0.1,
+                                                eval_batch_size=2)
     # initialize model
     logging.info("Initializing model...".center(100, "="))
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen2.5-Math-1.5B",
+        model_name_or_path,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
@@ -214,42 +213,37 @@ def main(model_name_or_path: str,
             return 1.0
     warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=linear_warmup)
     
-    wandb.login()
-    with wandb.init(
-            project=f"SFT",
-            name=f"{model_name}-data_size-{num_examples}",
-            config={
-                "learning_rate": 2e-5,
-                "weight_decay": 1e-2,
-                "train_batch_size": 8,
-                "eval_batch_size": 2,
-                "total_steps": total_steps,
-                "warmup_steps": warmup_steps,
-                "gradient_accumulation_steps": gradient_accumulation_steps,
-            },
-            mode="offline"
-        ) as run:
-        run.define_metric("train_step")
-        run.define_metric("eval_step")
-        run.define_metric("train/*", step_metric="train_step")
-        run.define_metric("eval/*", step_metric="eval_step")
-        logging.info("Training start...".center(100, "="))
-        logging.info(f"Total epochs around {total_steps // len(train_loader) // 4}")
-        train(run,
-              train_loader=train_loader,
-            eval_loader=eval_loader,
-            model=model,
-            eval_model=eval_model,
-            tokenizer=tokenizer,
-            optimizer=optimizer,
-            lr_scheduler=cosine_scheduler,
-            warmup_scheduler=warmup_scheduler,
-            total_steps=total_steps,
-            warmup_steps=warmup_steps,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            log_interval=log_interval,
-            eval_interval=eval_interval,
-            output_dir=output_dir)
+    comet.login()
+    experiment = comet.start(project_name="SFT",
+                             workspace="leg-end",
+                             api_key="SJASztLoOjQpW2Sakl2PDV4YZ")
+    experiment.log_parameters({
+        "learning_rate": 2e-5,
+        "weight_decay": 1e-2,
+        "train_batch_size": 8,
+        "eval_batch_size": 2,
+        "total_steps": total_steps,
+        "warmup_steps": warmup_steps,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+    })
+    logging.info("Training start...".center(100, "="))
+    logging.info(f"Total epochs around {total_steps // len(train_loader) // 4}")
+    train(experiment,
+            train_loader=train_loader,
+        eval_loader=eval_loader,
+        model=model,
+        eval_model=eval_model,
+        tokenizer=tokenizer,
+        optimizer=optimizer,
+        lr_scheduler=cosine_scheduler,
+        warmup_scheduler=warmup_scheduler,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        log_interval=log_interval,
+        eval_interval=eval_interval,
+        output_dir=output_dir)
+    experiment.end()
     
 
 if __name__ == "__main__":

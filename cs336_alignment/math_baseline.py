@@ -1,5 +1,5 @@
 import os
-# os.environ["HF_ENDPOINT"] = 'https:/hf-mirror.com'
+os.environ["HF_ENDPOINT"] = 'https:/hf-mirror.com'
 os.environ["HF_HOME"] = "/data/lanyun/worksapce/assignment5-alignment/models"
 from vllm import LLM, SamplingParams
 # https://github.com/vllm-project/vllm/blob/main/examples/offline_inference
@@ -101,7 +101,7 @@ def main(input_path: str,
     # (4) calculate evaluation metrics
     # (5) serialize results {examples, model generations, evaluation scores} to disk
     model = LLM(model=model_name_or_path)
-    sampling_params = SamplingParams(temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"],
+    sampling_params = SamplingParams(n=2, temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"],
                                      include_stop_str_in_output=True, logprobs=1)
     raw_responses = model.generate(prompts, sampling_params)
     raw_responses = object_to_dict(raw_responses)
@@ -158,9 +158,16 @@ def slow_reward_check(result_path: str):
 
 
 if __name__ == '__main__':
-    main(input_path="/data/lanyun/worksapce/assignment5-alignment/data/gsm8k/test.jsonl",
-         model_name_or_path="Qwen/Qwen2.5-Math-1.5B",
-         output_path="/data/lanyun/worksapce/assignment5-alignment/data/gsm8k/test_output_debug.jsonl",
-         num_samples=2)
+    # main(input_path="/data/lanyun/worksapce/assignment5-alignment/data/gsm8k/test.jsonl",
+    #      model_name_or_path="Qwen/Qwen2.5-Math-1.5B",
+    #      output_path="/data/lanyun/worksapce/assignment5-alignment/data/gsm8k/test_output_debug.jsonl",
+    #      num_samples=2)
     # analyse_reward(result_path="/data/lanyun/worksapce/assignment5-alignment/data/gsm8k/test_output_slow.jsonl")
     # slow_reward_check(result_path="/data/lanyun/worksapce/assignment5-alignment/data/gsm8k/test_output.jsonl")
+    from transformers import AutoTokenizer
+    system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
+The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-1.5B")
+    text = tokenizer.apply_chat_template([{"role": "system", "content": system_prompt},
+             {"role": "user", "content": "What is the area of a circle with a radius of 5?"}], tokenize=False, add_generation_prompt=True)
+    print(text)

@@ -44,12 +44,11 @@ def run_tokenize_prompt_and_output(
     max_len = max(len(ids) for ids in input_ids_list)
     batch_input_ids = torch.full((len(input_ids_list), max_len), tokenizer.pad_token_id, dtype=torch.long)
     batch_reponse_masks = torch.zeros((len(input_ids_list), max_len), dtype=torch.long)
-    
+    # padding on the right side, since it's for training
     for i, (input_ids, response_mask) in enumerate(zip(input_ids_list, response_mask_list)):
         seq_len = len(input_ids)
         batch_input_ids[i, :seq_len] = input_ids
         batch_reponse_masks[i, :seq_len] = response_mask
-    
     return {
         "input_ids": batch_input_ids[:, :-1],
         "labels": batch_input_ids[:, 1:],
@@ -270,6 +269,7 @@ def run_compute_policy_gradient_loss(
         assert old_log_probs is not None, "old_log_probs must be provided for loss_type=grpo_clip"
         assert old_log_probs.shape == (batch_size, seq_len), "old_log_probs must have shape (batch_size, sequence_length)"
         loss, metadata = run_compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+        metadata['clip_fraction'] = metadata['clipped'].sum().item() / metadata['clipped'].numel()
     else:
         raise ValueError(f"Invalid loss type: {loss_type}")
     return loss, metadata
@@ -291,7 +291,10 @@ def run_masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = 
         torch.Tensor, the mean of the tensor along the specified
             dimension, considering only the elements with mask value 1.
     """
-    raise NotImplementedError
+    n_tokens = mask.sum(dim=dim)
+    masked_tensor = tensor * mask
+    return masked_tensor.sum(dim=dim) / n_tokens
+
 
 def run_sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
@@ -354,7 +357,18 @@ def run_grpo_microbatch_train_step(
         tuple[torch.Tensor, dict[str, torch.Tensor]]: 
             the policy gradient loss and its metadata.
     """
-    raise NotImplementedError
+    loss, metadata = run_compute_policy_gradient_loss(policy_log_probs=policy_log_probs,
+                                                      loss_type=loss_type,
+                                                      raw_rewards=raw_rewards,
+                                                      advantages=advantages,
+                                                      old_log_probs=old_log_probs,
+                                                      cliprange=cliprange)
+    loss_per_example = run_masked_mean(loss, response_mask, dim=1)  # (batch_size,)
+    loss = loss_per_example.mean() / gradient_accumulation_steps
+    loss.backward()
+    metadata['microbatch/loss'] = loss.detach()
+    metadata['microbatch/loss_per_example'] = loss_per_example.detach()
+    return loss, metadata
 
 
 def run_masked_normalize(

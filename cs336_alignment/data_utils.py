@@ -47,9 +47,8 @@ def gsm8k_data_loader(data_path: str,
             data = json.loads(line)
             prompts.append(instruction.format(question=data["question"]))
             answer = data["answer"]
-            think, answer = answer.rsplit('\n', maxsplit=1)
-            answer = answer[4:]
-            response = f" {think} </think> <answer>{answer} </answer>"
+            think, answer = answer.rsplit('####', maxsplit=1)
+            response = f" {think} </think> <answer> {answer.strip()} </answer>"
             answers.append(response)
     return prompts, answers
 
