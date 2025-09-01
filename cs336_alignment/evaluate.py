@@ -46,6 +46,12 @@ def log_generation(request_outputs: list[RequestOutput],
         log_num = batch_size
     log_num = max(1, min(log_num, batch_size))
     avg_response_len = 0
+    avg_response_len_correct = 0
+    avg_response_len_format = 0
+    avg_response_len_good = 0
+    correct_count = 0
+    format_count = 0
+    good_count = 0
     total_loss = 0
     n_tokens = 0
     gen_results = []
@@ -57,9 +63,23 @@ def log_generation(request_outputs: list[RequestOutput],
         cumulative_ce = -output.cumulative_logprob
         total_loss += cumulative_ce
         response_avg_token_entropy = cumulative_ce / (len(output.token_ids) + 1e-8)
-        avg_response_len += len(response.split(' '))
+        response_len = len(response.split(' '))
+        avg_response_len += response_len
         if reward_info is not None:
             reward = reward_info[idx]
+            if reward['reward'] == 1.0:
+                good_count += 1
+                avg_response_len_good += response_len
+                correct_count += 1
+                avg_response_len_correct += response_len
+                format_count += 1
+                avg_response_len_format += response_len
+            elif reward['correct_reward'] == 1.0:
+                correct_count += 1
+                avg_response_len_correct += response_len
+            elif reward['format_reward'] == 1.0:
+                format_count += 1
+                avg_response_len_format += response_len
         else:
             reward = {}
         if idx < log_num:
@@ -69,15 +89,38 @@ def log_generation(request_outputs: list[RequestOutput],
             if answers is not None:
                 logging.info(f"Ground-truth answer: {answers[idx]}")
             if reward_info is not None:
-                logging.info(f"Reward: {reward_info}")
+                logging.info(str(reward))
             logging.info(f"Response's average token entropy: {response_avg_token_entropy:.2f}")
         gen_results.append({"prompt": request_output.prompt, "answer": answers[idx], "response": response, **reward})
     avg_response_len /= batch_size
+    logging.info("Response length metrics".center(80, "*"))
     logging.info(f"Average response length: {avg_response_len:.2f}")
-    return gen_results, {f"{prefix}/n_tokens": n_tokens,
-                         f"{prefix}/avg_response_len": avg_response_len,
-                         f"{prefix}/avg_token_entropy": total_loss / (n_tokens + 1e-8),
-                         f"{prefix}/total_loss": total_loss}
+    metadata = {f"{prefix}/n_tokens": n_tokens,
+                f"{prefix}/avg_token_entropy": total_loss / (n_tokens + 1e-8),
+                f"{prefix}/total_loss": total_loss,
+                f"{prefix}/avg_response_len": avg_response_len}
+    if reward_info is not None:
+        avg_response_len_good /= (good_count + 1e-8)
+        avg_response_len_correct /= (correct_count + 1e-8)
+        avg_response_len_format /= (format_count + 1e-8)
+        correct_acc = correct_count / batch_size * 100
+        good_acc = good_count / batch_size * 100
+        format_acc = format_count / batch_size * 100
+        logging.info(f"Average response length for good response: {avg_response_len_good:.2f}")
+        logging.info(f"Average response length for correct response: {avg_response_len_correct:.2f}")
+        logging.info(f"Average response length for format response: {avg_response_len_format:.2f}")
+        logging.info("Accuracy metrics".center(80, "*"))
+        logging.info(f"Good accuary: {good_acc:.2f}% [{good_count}/{batch_size}]")
+        logging.info(f"Correct accuracy: {correct_acc:.2f}% [{correct_count}/{batch_size}]")
+        logging.info(f"Format accuracy: {format_acc:.2f}% [{format_count}/{batch_size}]")
+        metadata.update({f"{prefix}/avg_response_len_correct": avg_response_len_correct,
+                          f"{prefix}/avg_response_len_good": avg_response_len_good,
+                          f"{prefix}/avg_response_len_format": avg_response_len_format,
+                          f"{prefix}/good_acc": good_acc,
+                          f"{prefix}/correct_acc": correct_acc,
+                          f"{prefix}/format_acc": format_acc})
+    logging.info("End generation Log".center(80, "="))
+    return gen_results, metadata
 
 
 def evaluate_vllm(
@@ -104,6 +147,7 @@ def evaluate_vllm(
     request_outputs: list[RequestOutput] = vllm_model.generate(prompts, eval_sampling_params)
     if reward_fn is not None:
         reward_info = []
+        logging.info("Computing reward information...")
         for request_output, answer in zip(request_outputs, gt_answers):
             reward_info.append(reward_fn(request_output.outputs[0].text.strip(), answer, **reward_fn_kwargs))
     else:

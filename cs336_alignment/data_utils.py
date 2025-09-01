@@ -4,8 +4,10 @@ import os
 from xopen import xopen
 import json
 import pandas as pd
+import re
 from typing import Any
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
+from math_verify import parse, verify, ExprExtractionConfig
 
 
 def look_data(data_path: str, num_samples: int = 10) -> None:
@@ -37,6 +39,25 @@ def alpaca_data_loader(data_path: str,
     return prompts, answers
 
 
+def gsm8k_reward_fn(answer: str, ground_truth: str) -> dict[str, float]:
+    pattern = r'\d+\.\d+|\d+/\d+|\d+'
+    nums = re.findall(pattern, answer) # 使用正则表达式在answer中查找所有数字
+    if len(nums) == 0:
+        reward_correct = 0.0
+    else:
+        lastnum = nums[-1] # 用answer中最后一个数字和ground_truth做比较
+        ans = parse(lastnum, extraction_config=[ExprExtractionConfig()])
+        ground_truth = ground_truth.split("<answer>")[-1].replace("</answer>", "").strip()
+        ground_truth = parse(ground_truth, extraction_config=[ExprExtractionConfig()])
+        reward_correct = 1.0 if verify(ans, ground_truth) else 0.0
+    
+    pattern = r".*?</think><answer>.*?</answer>$"
+    reward_format = 1.0 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) else 0.0
+    
+    reward = 1.0 if reward_correct == 1.0 and reward_format == 1.0 else 0.0
+    return {"reward": reward, "correct_reward": reward_correct, "format_reward": reward_format}
+
+
 def gsm8k_data_loader(data_path: str,
                       instruction: str):
     instruction = may_load_instruction(instruction)
@@ -48,7 +69,7 @@ def gsm8k_data_loader(data_path: str,
             prompts.append(instruction.format(question=data["question"]))
             answer = data["answer"]
             think, answer = answer.rsplit('####', maxsplit=1)
-            response = f" {think} </think> <answer> {answer.strip()} </answer>"
+            response = f"{think}</think><answer>{answer.strip()}</answer>"
             answers.append(response)
     return prompts, answers
 
@@ -157,6 +178,7 @@ def get_data_loader(data_path: str,
                     instruction: str,
                     batch_size: int,
                     num_workers: int,
+                    shuffle: bool = True,
                     eval_data_path: str | None = None,
                     num_examples: int | None = None,
                     eval_ratio: float = 0.0,
@@ -176,7 +198,7 @@ def get_data_loader(data_path: str,
             dataset = Subset(dataset, range(num_examples))
         data_loader = DataLoader(dataset,
                                 batch_size=batch_size,
-                                shuffle=True,
+                                shuffle=shuffle,
                                 num_workers=num_workers)
         return data_loader
     elif eval_data_path is not None:
@@ -185,7 +207,7 @@ def get_data_loader(data_path: str,
             dataset = Subset(dataset, range(num_examples))
         train_loader = DataLoader(dataset,
                                 batch_size=batch_size,
-                                shuffle=True,
+                                shuffle=shuffle,
                                 num_workers=num_workers)
         eval_dataset = SFTDataset(eval_data_path, instruction)
         eval_loader = DataLoader(eval_dataset,
@@ -203,7 +225,7 @@ def get_data_loader(data_path: str,
             train_dataset = Subset(train_dataset, range(num_examples))
         train_loader = DataLoader(train_dataset,
                                   batch_size=batch_size,
-                                  shuffle=True,
+                                  shuffle=shuffle,
                                   num_workers=num_workers)
         eval_loader = DataLoader(eval_dataset,
                                  batch_size=eval_batch_size,
