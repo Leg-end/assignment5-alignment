@@ -21,6 +21,7 @@ dependencies = [
     "wandb>=0.19.8",
     "xopen>=2.0.2",
     "comet-ml>=3.51.0",
+    "trl>=0.19.1",
 ]
 
 [tool.setuptools.packages.find]

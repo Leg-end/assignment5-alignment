@@ -1,0 +1,77 @@
+GRPOTrainer
+
+generation_batch_size (rollout_batch_size ?)
+    Batch size to use for generation. If `None`, it defaults to the effective training batch size:
+    `per_device_train_batch_size * num_processes * gradient_accumulation_steps(steps_per_generation)`.
+steps_per_generation
+    Number of optimization steps per generation. If `None`, it defaults to gradient_accumulation_steps
+total_train_batch_size = self._train_batch_size * args.gradient_accumulation_steps
+_get_train_sampler
+    # Returns a sampler that
+    # 1. ensures each prompt is repeated across multiple processes. This guarantees that identical prompts are
+    #    distributed to different GPUs, allowing rewards to be computed and normalized correctly within each prompt
+    #    group. Using the same seed across processes ensures consistent prompt assignment, preventing discrepancies
+    #    in group formation.
+    # 2. repeats the batch multiple times to allow reusing generations across multiple updates. Refer to
+    #    _prepare_inputs to see how the generations are stored and reused.
+
+    # In the following figure, the values are the prompt indices. The first row shows the first sampled batch, the
+    # second row shows the second sampled batch, and so on.
+    #
+    #                                      |   GPU 0  |   GPU 1  |
+    #
+    #                 global_step   step    <-───>  num_generations=2 (group size)
+    #                                       <-───────> per_device_train_batch_size=3
+    #  grad_accum    ▲  ▲  0          0     0   0   1   1   2   2   <- Generate for the first `steps_per_generation` (prompts 0 to 11); store the completions; use the first slice to compute the loss
+    #     =2         ▼  |  0          1     3   3   4   4   5   5   <- Take the stored generations and use the second slice to compute the loss
+    #                   |
+    #                   |  1          2     6   6   7   7   8   8   <- Take the stored generations and use the third slice to compute the loss
+    #  steps_per_gen=4  ▼  1          3     9   9  10  10  11  11   <- Take the stored generations and use the fourth slice to compute the loss
+    #
+    #                      2          4    12  12  13  13  14  14   <- Generate for the second `steps_per_generation` (prompts 12 to 23); store the completions; use the first slice to compute the loss
+    #                      2          5    15  15  16  16  17  17   <- Take the stored generations and use the second slice to compute the loss
+    return RepeatSampler(
+        data_source=dataset,
+        mini_repeat_count=self.num_generations,  # Number of times to repeat each index per batch.
+        batch_size=self.args.generation_batch_size // self.num_generations,  # Number of unique indices per batch.
+        repeat_count=self.num_iterations * self.args.steps_per_generation,  # Number of times to repeat the full sampling process.
+        shuffle=self.shuffle_dataset,
+        seed=self.args.seed,
+    )
+    # self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper, off-policy
+get_train_dataloader
+    DataLoader(train_dataset, self._train_batch_size * self.args.steps_per_generation)
+num_train_samples = max_steps * total_train_batch_size
+num_update_steps_per_epoch = max(len_dataloader // args.gradient_accumulation_steps, 1)
+num_train_epochs = max_steps // num_update_steps_per_epoch + int(
+                    max_steps % num_update_steps_per_epoch > 0
+                )
+for epoch in range(epochs_trained, num_train_epochs):
+    total_updates = steps_in_epoch // args.gradient_accumulation_steps + 1
+    for _ in range(total_updates):
+        num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
+        batch_samples, num_items_in_batch = self.get_batch_samples(epoch_iterator, num_batches, args.device)
+        for i, inputs in enumerate(batch_samples):
+            tr_loss_step = self.training_step(model, inputs, num_items_in_batch) {
+                inputs = self._prepare_inputs(inputs) {
+                    # Prepares inputs for model training/evaluation by managing completion generation and batch handling.
+                    # During training:
+                    #   - Receives the local generation batch (Per-GPU batch size × steps per generation)
+                    #     from the modified training dataloader instead of the standard local batch
+                    #   - Generates completions once for the entire generation batch and splits it into batches of size
+                    #     `per_device_train_batch_size`
+                    #   - Buffers these completions and returns the appropriate slice for the current accumulation step
+                    #   - Optimizes by regenerating completions only periodically (every steps_per_generation * num_iterations)
+                    # During evaluation:
+                    #   - The input is treated as a standard local batch (no accumulation, no multiple iterations)
+                    #   - Completions are generated for each batch without buffering or reuse
+                    # Returns a single local batch in both cases.
+                }
+                loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+                self.accelerator.backward(loss, **kwargs)
+            }
+
+CS336
+
+train_batch_size = micro_train_batch_size * gradient_accumulation_steps
+num_train_samples = n_grpo_steps * train_batch_size

@@ -8,13 +8,14 @@ import comet_ml as comet
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 from vllm import LLM, SamplingParams
 from unittest.mock import patch
-from transformers import PreTrainedModel, Trainer
+from transformers import PreTrainedModel, GenerationConfig
 from torch.utils.data import DataLoader
 from tests.adapters import run_get_response_log_probs, run_sft_microbatch_train_step, run_masked_normalize, run_tokenize_prompt_and_output
 from cs336_alignment.data_utils import get_data_loader, gsm8k_reward_fn
 from transformers import AutoTokenizer, PreTrainedTokenizerBase, AutoModelForCausalLM
 from cs336_alignment.utils import set_logger
 from cs336_alignment.evaluate import evaluate_vllm
+from tqdm import tqdm
 import logging
 
 import torch
@@ -58,22 +59,60 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     state_dict = policy.state_dict()
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
+    # Reset cache on vLLM
+    llm.reset_prefix_cache()
     
 
 @torch.no_grad()
 def evaluate(eval_loader: DataLoader,
-             model: LLM,
-             sampling_params: SamplingParams):
-    prompt_strs = eval_loader.dataset.prompts
-    response_strs = eval_loader.dataset.answers
-    eval_results = evaluate_vllm(vllm_model=model,
-                                prompts=prompt_strs,
-                                gt_answers=response_strs,
-                                reward_fn=gsm8k_reward_fn,
-                                eval_sampling_params=sampling_params)
-    eval_loss = eval_results['eval/total_loss']
-    eval_loss /= len(prompt_strs)
-    return eval_loss, eval_results
+             model: LLM | PreTrainedModel,
+             sampling_params: SamplingParams | None = None,
+             tokenizer: PreTrainedTokenizerBase | None = None):
+    if isinstance(model, LLM):
+        assert sampling_params is not None and isinstance(sampling_params, SamplingParams)
+        prompt_strs = eval_loader.dataset.prompts
+        response_strs = eval_loader.dataset.answers
+        eval_results = evaluate_vllm(vllm_model=model,
+                                    prompts=prompt_strs,
+                                    gt_answers=response_strs,
+                                    reward_fn=gsm8k_reward_fn,
+                                    eval_sampling_params=sampling_params)
+        eval_loss = eval_results['eval/total_loss']
+        eval_loss /= len(prompt_strs)
+        return eval_loss, eval_results
+    else:
+        assert tokenizer is not None
+        device = model.device
+        model.eval()
+        total_loss = 0.0
+        total_top_loss = 0.0
+        n_tokens = 0
+        for batch in tqdm(eval_loader, desc="Evaluating"):
+            prompt_strs, response_strs = batch
+            batch = run_tokenize_prompt_and_output(prompt_strs, response_strs, tokenizer)
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            response_mask = batch["response_mask"].to(device)
+            output = run_get_response_log_probs(model=model,
+                                                input_ids=input_ids,
+                                                labels=labels,
+                                                return_token_entropy=True,
+                                                return_top_token_entropy=True)
+            policy_log_probs = output['log_probs']
+            policy_top_log_probs = output['top_log_probs']
+            total_loss += run_masked_normalize(-policy_log_probs, response_mask)
+            total_top_loss += run_masked_normalize(-policy_top_log_probs, response_mask)
+            n_tokens += response_mask.sum().item()
+        total_loss = total_loss.item()
+        total_top_loss = total_top_loss.item()
+        avg_token_ce = total_loss / (n_tokens + 1e-8)
+        metadata = {"eval/avg_token_ce": avg_token_ce,
+                    "eval/total_loss": total_loss,
+                    "eval/total_top_loss": total_top_loss,
+                    "eval/eval_top_loss": total_top_loss / (len(eval_loader.dataset) + 1e-8),
+                    "eval/n_tokens": n_tokens}
+        eval_loss = total_loss / (len(eval_loader.dataset) + 1e-8)
+        return eval_loss, metadata
     
 
 def train(experiment,
@@ -119,8 +158,7 @@ def train(experiment,
             output = run_get_response_log_probs(model=model,
                                                 input_ids=input_ids,
                                                 labels=labels,
-                                                return_token_entropy=do_backward,
-                                                return_token_id=do_backward)
+                                                return_token_entropy=do_backward)
             loss, metadata = run_sft_microbatch_train_step(
                 policy_log_probs=output["log_probs"],
                 response_mask=response_mask,
@@ -255,16 +293,25 @@ def evaluation(model_path: str,
                instruction: str,
                seed=1234):
     # TODO: isolated evaluation has result doesn't match the one during training.
+    # May cause by failed weights loading, see trl.GRPOTrainer._move_model_to_vllm
     vllm_set_random_seed(seed)
-    eval_model = init_vllm(model_path, "cuda:1")
     eval_loader = get_data_loader(data_path=eval_data_path,
                                   instruction=instruction,
                                   batch_size=16,
                                   num_workers=4,
                                   shuffle=False)
-    sampling_params = SamplingParams(temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"],
-                                     include_stop_str_in_output=True, logprobs=1)
-    eval_loss, eval_metadata = evaluate(eval_loader, eval_model, sampling_params)
+    # eval_model = init_vllm(model_path, "cuda:1")
+    # sampling_params = SamplingParams(temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"],
+    #                                  include_stop_str_in_output=True, logprobs=1)
+    # eval_loss, eval_metadata = evaluate(eval_loader, eval_model, sampling_params=sampling_params)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    eval_model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    )
+    eval_model.to("cuda:0")
+    eval_loss, eval_metadata = evaluate(eval_loader, eval_model, tokenizer=tokenizer)
     print(f"Eval Loss: {eval_loss:.4f}")
     print("eval metrics".center(100, "#"))
     for k, v in eval_metadata.items():
@@ -284,7 +331,7 @@ if __name__ == "__main__":
     #      log_interval=10,
     #      eval_interval=100,
     #      output_dir="/data/lanyun/worksapce/assignment5-alignment/models/sft")
-    evaluation(model_path="/data/lanyun/worksapce/assignment5-alignment/models/sft/Qwen/Qwen2.5-Math-1.5B/checkpoint-128",
+    evaluation(model_path="/data/lanyun/worksapce/assignment5-alignment/models/sft/Qwen/Qwen2.5-Math-1.5B/checkpoint-512",
                eval_data_path="/data/lanyun/worksapce/assignment5-alignment/data/gsm8k/test.jsonl",
                instruction="/data/lanyun/worksapce/assignment5-alignment/cs336_alignment/prompts/r1_zero.prompt")
     

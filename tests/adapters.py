@@ -149,7 +149,7 @@ def run_get_response_log_probs(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     return_token_entropy: bool,
-    return_token_id: bool = False
+    return_top_token_entropy: bool = False,
 ) -> torch.Tensor:
     """Get the conditional log-probs of the response given the prompt,
         and optionally the entropy of the next token predictions.
@@ -180,9 +180,10 @@ def run_get_response_log_probs(
     if return_token_entropy:
         token_entropy = run_compute_entropy(logits)
         return_dict["token_entropy"] = token_entropy
-    if return_token_id:
-        token_ids = torch.argmax(logits, dim=-1)
-        return_dict["token_ids"] = token_ids
+    if return_top_token_entropy:
+        top_logits, top_token_ids = torch.max(logits, dim=-1)
+        return_dict["top_token_ids"] = top_token_ids
+        return_dict["top_log_probs"] = top_logits - torch.logsumexp(logits, dim=-1)
     return return_dict
 
 

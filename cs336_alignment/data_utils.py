@@ -5,8 +5,8 @@ from xopen import xopen
 import json
 import pandas as pd
 import re
-from typing import Any
-from torch.utils.data import Dataset, DataLoader, random_split, Subset
+from typing import Any, Callable, Optional, Union, Iterable
+from torch.utils.data import Dataset, DataLoader, random_split, Subset, Sampler
 from math_verify import parse, verify, ExprExtractionConfig
 
 
@@ -171,18 +171,21 @@ class SFTDataset(Dataset):
         # think, answer = answer.rsplit('\n', maxsplit=1)
         # answer = answer[4:]
         # response = f" {think} </think> <answer>{answer} </answer>"
-        return prompt, answer
+        return {"prompt": prompt, "answer": answer}
     
 
-def get_data_loader(data_path: str,
-                    instruction: str,
+def get_data_loader(dataset: Union[str, Dataset],
                     batch_size: int,
-                    num_workers: int,
+                    instruction: Optional[str] = None,
+                    sampler: Union[Sampler, Iterable, None] = None,
+                    collate_fn: Optional[Callable[[list[Any]], Any]] = None,
+                    num_workers: int = 4,
                     shuffle: bool = True,
-                    eval_data_path: str | None = None,
-                    num_examples: int | None = None,
+                    num_examples: Optional[int] = None,
                     eval_ratio: float = 0.0,
-                    eval_batch_size: int | None = None):
+                    eval_batch_size: int | None = None,
+                    eval_sampler: Union[Sampler, Iterable, None] = None,
+                    eval_collate_fn: Optional[Callable[[list[Any]], Any]] = None,):
     # def collate_fn(batch):
     #     prompt_strs = []
     #     output_strs = []
@@ -190,48 +193,32 @@ def get_data_loader(data_path: str,
     #         prompt_strs.append(prompt)
     #         output_strs.append(answer)
     #     return run_tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
-    
-    dataset = SFTDataset(data_path, instruction)
-    if eval_data_path is None and eval_ratio == 0.0:
-        if num_examples is not None:
-            num_examples = min(max(128, num_examples), len(dataset))
-            dataset = Subset(dataset, range(num_examples))
-        data_loader = DataLoader(dataset,
-                                batch_size=batch_size,
-                                shuffle=shuffle,
-                                num_workers=num_workers)
-        return data_loader
-    elif eval_data_path is not None:
-        if num_examples is not None:
-            num_examples = min(max(128, num_examples), len(dataset))
-            dataset = Subset(dataset, range(num_examples))
-        train_loader = DataLoader(dataset,
-                                batch_size=batch_size,
-                                shuffle=shuffle,
-                                num_workers=num_workers)
-        eval_dataset = SFTDataset(eval_data_path, instruction)
-        eval_loader = DataLoader(eval_dataset,
-                                 batch_size=eval_batch_size or batch_size,
-                                 shuffle=False,
-                                 num_workers=num_workers)
-        return train_loader, eval_loader
-    elif eval_ratio > 0.0:
+    if isinstance(dataset, str):
+        assert instruction is not None, "Instruction is required when dataset is a path"
+        dataset = SFTDataset(dataset, instruction)
+    if eval_ratio > 0.0:
         eval_ratio = max(min(eval_ratio, 0.3), 0.1)
         eval_size = int(len(dataset) * eval_ratio)
         eval_batch_size = eval_batch_size or batch_size
-        train_dataset, eval_dataset = random_split(dataset, [len(dataset) - eval_size, eval_size])
-        if num_examples is not None:
-            num_examples = min(max(128, num_examples), len(train_dataset))
-            train_dataset = Subset(train_dataset, range(num_examples))
-        train_loader = DataLoader(train_dataset,
-                                  batch_size=batch_size,
-                                  shuffle=shuffle,
-                                  num_workers=num_workers)
+        dataset, eval_dataset = random_split(dataset, [len(dataset) - eval_size, eval_size])
+    if num_examples is not None:
+        num_examples = min(max(128, num_examples), len(dataset))
+        dataset = Subset(dataset, range(num_examples))
+    data_loader = DataLoader(dataset,
+                             batch_size=batch_size,
+                             shuffle=shuffle,
+                             num_workers=num_workers,
+                             sampler=sampler,
+                             collate_fn=collate_fn)
+    if eval_ratio > 0.0:
         eval_loader = DataLoader(eval_dataset,
                                  batch_size=eval_batch_size,
                                  shuffle=False,
-                                 num_workers=num_workers)
-        return train_loader, eval_loader
+                                 num_workers=num_workers,
+                                 eval_sampler=eval_sampler,
+                                 eval_collate_fn=eval_collate_fn)
+        return data_loader, eval_loader
+    return data_loader
 
 
 if __name__ == '__main__':
