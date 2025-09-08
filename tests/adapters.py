@@ -365,11 +365,16 @@ def run_grpo_microbatch_train_step(
                                                       old_log_probs=old_log_probs,
                                                       cliprange=cliprange)
     loss_per_example = run_masked_mean(loss, response_mask, dim=1)  # (batch_size,)
-    loss = loss_per_example.mean() / gradient_accumulation_steps
+    batch_size = loss_per_example.shape[0]
+    total_loss = loss_per_example.sum()
+    loss = total_loss / batch_size / gradient_accumulation_steps
     loss.backward()
-    metadata['microbatch/loss'] = loss.detach()
-    metadata['microbatch/loss_per_example'] = loss_per_example.detach()
-    return loss, metadata
+    n_tokens = response_mask.sum().item()
+    metadata["train/total_loss"] = total_loss.item()
+    avg_token_ce = total_loss.item() / (n_tokens + 1e-8)
+    metadata["train/avg_token_ce"] = avg_token_ce
+    metadata["train/n_tokens"] = n_tokens
+    return loss.detach(), metadata
 
 
 def run_masked_normalize(
